@@ -26,10 +26,13 @@ typedef NS_ENUM(NSInteger, FitMode) {
 @property (nonatomic) NSUInteger pageNumber;
 @property (nonatomic) CGFloat zoom;
 @property (nonatomic) CGFloat backingScale;
+@property (nonatomic, copy) void (^zoomBy)(BOOL zoomIn);
 - (void)renderPage;
 @end
 
-@implementation PDFPageView
+@implementation PDFPageView {
+    CGFloat _scrollAccum;
+}
 
 - (instancetype)init {
     self = [super init];
@@ -56,12 +59,33 @@ typedef NS_ENUM(NSInteger, FitMode) {
     CGImageRelease(image);
 }
 
+- (void)scrollWheel:(NSEvent *)event {
+    if (self.zoomBy && (event.modifierFlags & NSEventModifierFlagShift)) {
+        if (event.hasPreciseScrollingDeltas) {
+            _scrollAccum += event.scrollingDeltaY;
+            if (_scrollAccum > 3.0) {
+                self.zoomBy(YES);
+                _scrollAccum = 0;
+            } else if (_scrollAccum < -3.0) {
+                self.zoomBy(NO);
+                _scrollAccum = 0;
+            }
+        } else {
+            if (event.deltaY > 0) {
+                self.zoomBy(YES);
+            } else if (event.deltaY < 0) {
+                self.zoomBy(NO);
+            }
+        }
+        return; // consume – prevents NSScrollView from scrolling
+    }
+    [super scrollWheel:event];
+}
+
 @end
 
 // ── AppDelegate ──────────────────────────────────────────────────────
-@interface AppDelegate () {
-    CGFloat _shiftScrollAccum;
-}
+@interface AppDelegate ()
 @property (strong) NSWindow *window;
 @property (strong) NSScrollView *scrollView;
 @property (strong) PDFPageView *pageView;
@@ -114,29 +138,18 @@ typedef NS_ENUM(NSInteger, FitMode) {
 
     // ── Gesture recognisers ──
     // Pinch-to-zoom
+    __weak __typeof(self) ws = self;
     NSMagnificationGestureRecognizer *pinch = [[NSMagnificationGestureRecognizer alloc]
                                                  initWithTarget:self action:@selector(handlePinch:)];
     [self.pageView addGestureRecognizer:pinch];
 
-    // Shift + scroll wheel = zoom
-    __weak __typeof(self) ws = self;
-    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel
-                                         handler:^NSEvent *(NSEvent *event) {
+    // Shift + scroll wheel = zoom (via PDFPageView scrollWheel: override)
+    self.pageView.zoomBy = ^(BOOL zoomIn) {
         __typeof(self) ss = ws;
-        if (ss && (event.modifierFlags & NSEventModifierFlagShift) && ss.renderer) {
-            ss->_shiftScrollAccum += event.scrollingDeltaY;
-            static const CGFloat kThreshold = 8.0;
-            if (ss->_shiftScrollAccum > kThreshold) {
-                [ss zoomInAction:nil];
-                ss->_shiftScrollAccum = 0;
-            } else if (ss->_shiftScrollAccum < -kThreshold) {
-                [ss zoomOutAction:nil];
-                ss->_shiftScrollAccum = 0;
-            }
-            return nil; // consume event, prevent scrolling
-        }
-        return event;
-    }];
+        if (!ss) return;
+        if (zoomIn) [ss zoomInAction:nil];
+        else        [ss zoomOutAction:nil];
+    };
 
     // ── State ──
     self.currentPage = 0;
