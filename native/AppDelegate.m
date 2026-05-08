@@ -20,19 +20,43 @@ typedef NS_ENUM(NSInteger, FitMode) {
     FitModePage,
 };
 
+// ── PDF scroll view (intercepts Shift+scroll before scrolling) ─────
+@interface PDFScrollView : NSScrollView
+@property (nonatomic, copy) void (^zoomBy)(BOOL zoomIn);
+@end
+
+@implementation PDFScrollView
+- (void)scrollWheel:(NSEvent *)event {
+    if (self.zoomBy && (event.modifierFlags & NSEventModifierFlagShift)) {
+        // macOS converts Shift+scroll to horizontal scrolling (deltaX)
+        // deltaY is always zero when Shift is held
+        CGFloat delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaX : event.deltaX;
+        if (delta > 0.5) {
+            self.zoomBy(YES);
+        } else if (delta < -0.5) {
+            self.zoomBy(NO);
+        }
+        return; // consume – prevents horizontal scrolling
+    }
+    [super scrollWheel:event];
+}
+@end
+
 // ── PDF page view (the content inside the scroll view) ──────────────
 @interface PDFPageView : NSView
 @property (nonatomic, weak) MuPDFRenderer *renderer;
 @property (nonatomic) NSUInteger pageNumber;
 @property (nonatomic) CGFloat zoom;
 @property (nonatomic) CGFloat backingScale;
-@property (nonatomic, copy) void (^zoomBy)(BOOL zoomIn);
 - (void)renderPage;
 @end
 
-@implementation PDFPageView {
-    CGFloat _scrollAccum;
-}
+@interface PDFPageView ()
+@property NSPoint panStartLocation;
+@property NSPoint scrollStartOrigin;
+@end
+
+@implementation PDFPageView
 
 - (instancetype)init {
     self = [super init];
@@ -40,6 +64,54 @@ typedef NS_ENUM(NSInteger, FitMode) {
         self.wantsLayer = YES;
     }
     return self;
+}
+
+- (BOOL)isFlipped {
+    return YES;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *area in self.trackingAreas) {
+        [self removeTrackingArea:area];
+    }
+    NSTrackingArea *ta = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                      options:NSTrackingMouseEnteredAndExited | NSTrackingActiveInActiveApp
+                                                        owner:self
+                                                     userInfo:nil];
+    [self addTrackingArea:ta];
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    [[NSCursor openHandCursor] push];
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    [NSCursor pop];
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    self.panStartLocation = [self convertPoint:event.locationInWindow fromView:nil];
+    self.scrollStartOrigin = self.enclosingScrollView.contentView.bounds.origin;
+    [[NSCursor closedHandCursor] push];
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+    NSPoint cur = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat dx = cur.x - self.panStartLocation.x;
+    CGFloat dy = cur.y - self.panStartLocation.y;
+
+    NSScrollView *sv = self.enclosingScrollView;
+    if (!sv) return;
+    NSPoint pt = self.scrollStartOrigin;
+    pt.x -= dx;
+    pt.y -= dy;
+    [sv.contentView scrollToPoint:pt];
+    [sv reflectScrolledClipView:sv.contentView];
+}
+
+- (void)mouseUp:(NSEvent *)event {
+    [NSCursor pop];
 }
 
 - (void)renderPage {
@@ -59,35 +131,12 @@ typedef NS_ENUM(NSInteger, FitMode) {
     CGImageRelease(image);
 }
 
-- (void)scrollWheel:(NSEvent *)event {
-    if (self.zoomBy && (event.modifierFlags & NSEventModifierFlagShift)) {
-        if (event.hasPreciseScrollingDeltas) {
-            _scrollAccum += event.scrollingDeltaY;
-            if (_scrollAccum > 3.0) {
-                self.zoomBy(YES);
-                _scrollAccum = 0;
-            } else if (_scrollAccum < -3.0) {
-                self.zoomBy(NO);
-                _scrollAccum = 0;
-            }
-        } else {
-            if (event.deltaY > 0) {
-                self.zoomBy(YES);
-            } else if (event.deltaY < 0) {
-                self.zoomBy(NO);
-            }
-        }
-        return; // consume – prevents NSScrollView from scrolling
-    }
-    [super scrollWheel:event];
-}
-
 @end
 
 // ── AppDelegate ──────────────────────────────────────────────────────
 @interface AppDelegate ()
 @property (strong) NSWindow *window;
-@property (strong) NSScrollView *scrollView;
+@property (strong) PDFScrollView *scrollView;
 @property (strong) PDFPageView *pageView;
 @property (strong) MuPDFRenderer *renderer;
 @property (strong) NSTextField *pageField;
@@ -122,8 +171,8 @@ typedef NS_ENUM(NSInteger, FitMode) {
     toolbar.allowsUserCustomization = NO;
     self.window.toolbar = toolbar;
 
-    // ── Scroll view ──
-    self.scrollView = [[NSScrollView alloc] initWithFrame:self.window.contentView.bounds];
+    // ── Scroll view (custom subclass intercepts Shift+scroll) ──
+    self.scrollView = [[PDFScrollView alloc] initWithFrame:self.window.contentView.bounds];
     self.scrollView.hasVerticalScroller = YES;
     self.scrollView.hasHorizontalScroller = YES;
     self.scrollView.autohidesScrollers = YES;
@@ -136,17 +185,16 @@ typedef NS_ENUM(NSInteger, FitMode) {
 
     [self.window.contentView addSubview:self.scrollView];
 
-    // ── Gesture recognisers ──
-    // Pinch-to-zoom
-    __weak __typeof(self) ws = self;
+    // ── Pinch-to-zoom ──
     NSMagnificationGestureRecognizer *pinch = [[NSMagnificationGestureRecognizer alloc]
                                                  initWithTarget:self action:@selector(handlePinch:)];
     [self.pageView addGestureRecognizer:pinch];
 
-    // Shift + scroll wheel = zoom (via PDFPageView scrollWheel: override)
-    self.pageView.zoomBy = ^(BOOL zoomIn) {
+    // ── Shift+scroll zoom (PDFScrollView.scrollWheel: intercepts it) ──
+    __weak __typeof(self) ws = self;
+    self.scrollView.zoomBy = ^(BOOL zoomIn) {
         __typeof(self) ss = ws;
-        if (!ss) return;
+        if (!ss || !ss.renderer) return;
         if (zoomIn) [ss zoomInAction:nil];
         else        [ss zoomOutAction:nil];
     };
