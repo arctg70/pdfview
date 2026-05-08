@@ -48,6 +48,23 @@ run: $(BIN)
 open: bundle
 	open "$(APP_BUNDLE)"
 
+# ── DMG package ───────────────────────────────────────────────────
+DMG_DIR    := $(BUILD_DIR)/dmg-staging
+DMG        := $(BUILD_DIR)/PDFViewer.dmg
+
+dmg: bundle
+	rm -rf "$(DMG_DIR)"
+	mkdir -p "$(DMG_DIR)"
+	cp -R "$(APP_BUNDLE)" "$(DMG_DIR)/"
+	ln -s /Applications "$(DMG_DIR)/Applications"
+	rm -f "$(DMG)"
+	hdiutil create -fs APFS -format UDZO \
+	  -srcfolder "$(DMG_DIR)" \
+	  -volname "PDFViewer" \
+	  "$(DMG)"
+	rm -rf "$(DMG_DIR)"
+	@echo "✓ DMG created at $(DMG)"
+
 # ── Clean ──────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BUILD_DIR)
